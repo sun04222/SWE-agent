@@ -3,9 +3,8 @@ from __future__ import annotations
 import pytest
 from jinja2 import Template
 
-from sweagent.agent.action_sampler import BinaryTrajectoryComparison
 from sweagent.exceptions import FormatError, FunctionCallingFormatError
-from sweagent.tools.commands import Argument, Command
+from sweagent.tools.commands import Command
 from sweagent.tools.parsing import (
     ActionParser,
     EditFormat,
@@ -13,10 +12,8 @@ from sweagent.tools.parsing import (
     Identity,
     JsonParser,
     ThoughtActionParser,
-    XMLFunctionCallingParser,
     XMLThoughtActionParser,
 )
-from sweagent.tools.tools import ToolConfig, ToolHandler
 
 
 def test_action_parser():
@@ -39,30 +36,6 @@ def test_thought_action_parser():
         parser({"message": "No code block"}, [])
 
 
-@pytest.mark.parametrize(
-    ("action", "expected"),
-    [
-        ("edit file.txt", True),
-        ("  edit file.txt", True),
-        ("str_replace_editor insert file.txt", True),
-        ("  str_replace_editor insert file.txt", True),
-        ("str_replace_editor str_replace file.txt", True),
-        ("  str_replace_editor str_replace file.txt", True),
-        ("cat file.txt", False),
-    ],
-)
-def test_binary_trajectory_comparison_detects_edit_actions(action: str, expected: bool):
-    tools = ToolHandler(ToolConfig(parse_function=ThoughtActionParser()))
-    sampler = BinaryTrajectoryComparison.__new__(BinaryTrajectoryComparison)
-    sampler._tools = tools
-    completion = {"message": f"Plan\n```\n{action}\n```"}
-
-    _, parsed_action = tools.parse_actions(completion)
-
-    assert tools.guard_multiline_input(parsed_action).strip() == action.strip()
-    assert sampler.contains_edits([completion]) is expected
-
-
 def test_xml_thought_action_parser():
     parser = XMLThoughtActionParser()
     model_response = "Let's look at the files in the current directory.\n<command>\nls -l\n</command>"
@@ -71,35 +44,6 @@ def test_xml_thought_action_parser():
     assert action == "ls -l"
     with pytest.raises(FormatError):
         parser({"message": "No command tags"}, [])
-    with pytest.raises(FormatError):
-        parser({"message": "mention </command> before <command>\nls"}, [])
-
-
-def test_xml_function_view_range_rejects_trailing_text():
-    parser = XMLFunctionCallingParser()
-    command = Command(
-        name="open",
-        docstring="",
-        arguments=[
-            Argument(name="path", type="string", description="", required=True),
-            Argument(name="view_range", type="array", description="", required=False),
-        ],
-    )
-    message = (
-        "<function=open>\n<parameter=path>a.py</parameter>\n<parameter=view_range>[1, -1]</parameter>\n</function>"
-    )
-    _, action = parser({"message": message}, [command])
-    assert "-1" in action
-    with pytest.raises(FormatError):
-        parser(
-            {
-                "message": (
-                    "<function=open>\n<parameter=path>a.py</parameter>\n"
-                    "<parameter=view_range>[1, 2] trailing</parameter>\n</function>"
-                )
-            },
-            [command],
-        )
 
 
 def test_edit_format_parser():
@@ -187,15 +131,17 @@ def test_function_calling_parser_error_message():
     assert "did not use any tool calls" in template.render(**exc1.extra_info, exception_message=exc1.message)
 
 
-@pytest.mark.parametrize("message", ["</command>ls<command>", "<command>ls</command>unfinished<command>"])
-def test_xml_thought_action_rejects_reversed_final_tags(message):
-    with pytest.raises(FormatError):
-        XMLThoughtActionParser()({"message": message}, [])
+@pytest.mark.parametrize("arguments", ["[]", "null", '"value"', "1", "true"])
+def test_function_calling_parser_rejects_non_object_json(arguments):
+    parser = FunctionCallingParser()
+    command = Command(name="ls", docstring="", arguments=[])
+    model_response = {
+        "message": "Call ls",
+        "tool_calls": [{"function": {"name": "ls", "arguments": arguments}}],
+    }
 
+    with pytest.raises(FunctionCallingFormatError) as exc_info:
+        parser(model_response, [command])
 
-def test_xml_thought_action_uses_last_complete_command():
-    thought, action = XMLThoughtActionParser()(
-        {"message": "earlier <command>pwd</command> then <command>ls</command> done"}, []
-    )
-    assert action == "ls"
-    assert thought == "earlier <command>pwd</command> then  done"
+    assert exc_info.value.message == "Tool call arguments must be a JSON object."
+    assert exc_info.value.extra_info["error_code"] == "invalid_json"

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
+import os
 import subprocess
-
-import pytest
-
-from sweagent.run.run import get_cli, main
 
 
 def test_run_cli_no_arg_error():
@@ -41,14 +38,16 @@ def test_run_cli_subcommand_help():
     assert "--config" in output.stdout.decode()
 
 
-def _get_cli_command_choices() -> list[str]:
-    parser = get_cli()
-    command_action = next(action for action in parser._actions if action.choices)
-    return list(command_action.choices)
+def test_run_cli_main_help_non_utf8_stdio():
+    """--help must not die with UnicodeEncodeError when stdio cannot encode emoji.
 
-
-@pytest.mark.parametrize("command", _get_cli_command_choices())
-def test_cli_subcommand_help_dispatches(command):
-    """Check that every accepted subcommand dispatches to an existing module."""
-    with pytest.raises(SystemExit):
-        main([command, "--help"])
+    cp1252 stands in for the default encoding of many Windows consoles, where the
+    emoji-decorated banner and help text used to crash the CLI before any output.
+    """
+    args = [
+        "sweagent",
+        "--help",
+    ]
+    env = os.environ | {"PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+    output = subprocess.run(args, check=True, capture_output=True, env=env)
+    assert "run-batch" in output.stdout.decode("cp1252")

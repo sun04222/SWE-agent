@@ -167,9 +167,8 @@ class ReviewerConfig(BaseModel):
     n_sample: int = 5
     reduce_by_std: float = 0.0
     score_range: tuple[float | None, float | None] = (None, None)
-    #: If set, we assume that the score is in the range [score_range[0], score_range[1]].
-    #: Out-of-range samples are omitted from ReviewerResult.outputs but receive the
-    #: failed-sample score in aggregation.
+    #: If set, we assume that the score is in the range [score_range[0], score_range[1]]
+    #: Reviews that are outside this range will be ignored
 
     type: Literal["reviewer"] = "reviewer"
 
@@ -296,18 +295,7 @@ class Chooser:
         self.config = config
         self.model = get_model(config.model, ToolConfig(parse_function=ActionParser()))
         self.logger = get_logger("chooser", emoji="🧠")
-        # Kept on the instance rather than built per call so that its spend is
-        # still readable through `stats` after `choose` returns.
-        self._preselector: Preselector | None = None
         # self.summarizer = Summarizer(config.summarizer, self.model) if config.summarizer else None
-
-    @property
-    def stats(self) -> InstanceStats:
-        """Everything this chooser spent, preselector included."""
-        stats = self.model.stats
-        if self._preselector is not None:
-            stats = stats + self._preselector.model.stats
-        return stats
 
     def interpret(self, response: str) -> int:
         # Use regex to extract the last number of the response
@@ -349,14 +337,9 @@ class Chooser:
         else:
             self.logger.debug(f"Got only {n_submitted} submitted submissions, disabling exit status filtering")
         if self.config.preselector and len(selected_indices) > 2:
-            if self._preselector is None:
-                self._preselector = Preselector(self.config.preselector)
-            preselector = self._preselector
+            preselector = Preselector(self.config.preselector)
             try:
                 preselector_output = preselector.choose(problem_statement, [input[i] for i in selected_indices])
-            except CostLimitExceededError:
-                # A cost limit must stop the run, so it may not be absorbed here.
-                raise
             except Exception as e:
                 self.logger.critical(f"Preselector failed: {e}", exc_info=True)
                 preselector_output = None
@@ -374,14 +357,11 @@ class Chooser:
                 self.logger.error("Preselector must have failed, ignoring it.")
         messages = self.build_messages(problem_statement, [input[i] for i in selected_indices])
         chosen_idx = None
-        # Assigned up front: the fallback below still reports the response, and a
-        # failed query must not turn into an UnboundLocalError there.
         response = ""
         try:
             response = self.model.query(messages)["message"]  # type: ignore
             chosen_idx = self.interpret(response)
         except CostLimitExceededError:
-            # A cost limit must stop the run, so it may not be absorbed here.
             raise
         except Exception as e:
             self.logger.critical(f"Chooser failed: {e}", exc_info=True)
@@ -451,31 +431,18 @@ class Reviewer(AbstractReviewer):
         for _ in range(self._config.n_sample):
             try:
                 answer = self._model.query(messages)["message"]
-            except CostLimitExceededError:
-                # A cost limit must stop the run, so it may not be absorbed here.
-                raise
             except Exception as e:
                 self.logger.warning(f"Query failed: {e}", exc_info=True)
-                # Keep failed samples in the aggregate. Otherwise a partially
-                # failing judge could make one optimistic answer represent all
-                # n_sample reviews (and remove the reduce_by_std penalty).
-                accepts.append(-100.0)
                 continue
             try:
                 score = self.interpret(answer)
             except ValueError as e:
                 self.logger.warning(f"Could not interpret response: {answer!r}, got {e}")
-                # Out-of-range and unparsable replies are ignored as answers,
-                # but still count as failed samples in the score aggregate.
-                accepts.append(-100.0)
                 continue
             answers.append(answer)
             accepts.append(score)
-        if not answers:
-            answers = ["No valid scores found, failing submission"]
         if not accepts:
-            # Preserve the existing fail-closed behavior for an empty sample
-            # configuration.
+            answers = ["No valid scores found, failing submission"]
             accepts = [-100.0]
         accept = sum(accepts) / len(accepts) - penalty
         std = np.std(accepts).item()
@@ -545,14 +512,11 @@ class ChooserRetryLoop(AbstractRetryLoop):
 
     @property
     def _total_stats(self) -> InstanceStats:
-        # The chooser only runs in `get_best()`, after the retry loop has ended,
-        # so folding it in here reports its spend without changing the budget
-        # decisions in `retry()` - where it is still zero.
-        return sum((s.model_stats for s in self._submissions), start=InstanceStats()) + self._chooser.stats
+        return sum((s.model_stats for s in self._submissions), start=InstanceStats())
 
     @property
     def review_model_stats(self) -> InstanceStats:
-        return self._chooser.stats
+        return InstanceStats()
 
     @property
     def _n_attempts(self) -> int:
@@ -692,14 +656,7 @@ class ScoreRetryLoop(AbstractRetryLoop):
         max_score = np.max(scores)
         max_indices = [i for i, s in enumerate(scores) if np.isclose(s, max_score)]
         # If there are multiple submissions with the same score, choose the shortest one
-        max_indices = sorted(
-            max_indices,
-            key=lambda i: (
-                self._submissions[i].model_stats.api_calls
-                if self._submissions[i].model_stats.api_calls is not None
-                else float("inf")
-            ),
-        )
+        max_indices = sorted(max_indices, key=lambda i: self._submissions[i].model_stats.api_calls or float("inf"))
         chosen_idx = max_indices[0]
         self.logger.info(f"Best submission: {chosen_idx}")
         return chosen_idx

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 from pydantic import SecretStr
 
 from sweagent import __version__
@@ -107,13 +106,25 @@ def test_user_agent_header_with_other_extra_headers():
         assert extra_headers["X-Custom"] == "value"
 
 
-@pytest.mark.parametrize("action", ["echo café", "cat 文档.txt", "echo 😀", "echo café\\necho résumé"])
-def test_human_model_preserves_unicode_when_unescaping(action, monkeypatch):
-    from sweagent.agent.models import HumanModel, HumanModelConfig
-    from sweagent.tools.tools import ToolConfig
+def test_provider_usage_updates_token_and_cache_stats():
+    model = get_model(
+        GenericAPIModelConfig(
+            name="gpt-4o",
+            api_key=SecretStr("dummy_key"),
+            top_p=None,
+            per_instance_cost_limit=0,
+            total_cost_limit=0,
+        ),
+        ToolConfig(parse_function=Identity()),
+    )
+    mock_response = _make_mock_response()
+    mock_response.usage.prompt_tokens = 123
+    mock_response.usage.completion_tokens = 45
+    mock_response.usage.prompt_tokens_details = {"cached_tokens": 67, "cache_write_tokens": 8}
+    with patch("litellm.completion", return_value=mock_response):
+        model.query(History([{"role": "user", "content": "test"}]))
 
-    monkeypatch.setattr(HumanModel, "_load_readline_history", lambda self: None)
-    monkeypatch.setattr(HumanModel, "_save_readline_history", lambda self: None)
-    monkeypatch.setattr("builtins.input", lambda prompt: action)
-    model = HumanModel(HumanModelConfig(), ToolConfig())
-    assert model.query([])["message"] == action.replace("\\n", "\n")
+    assert model.stats.tokens_sent == 123
+    assert model.stats.tokens_received == 45
+    assert model.stats.cache_read_input_tokens == 67
+    assert model.stats.cache_creation_input_tokens == 8

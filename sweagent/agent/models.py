@@ -133,9 +133,9 @@ class GenericAPIModelConfig(PydanticBaseModel):
     max_output_tokens: int | None = None
     """If set, this will override the max output tokens for the model that we usually look
     up from `litellm.model_cost`.
-    Positive values are sent to the provider as `max_tokens`, overriding the same
-    key in `completion_kwargs`. The provider enforces the generation limit.
-    For non-Anthropic models, None or 0 leaves `completion_kwargs` unchanged.
+    Use this for local models or if you want to set a custom max output token limit.
+    If this value is exceeded, a `ContextWindowExceededError` will be raised.
+    Set this to 0 to disable this check.
     """
 
     litellm_model_registry: str | None = None
@@ -270,33 +270,6 @@ ModelConfig = Annotated[
 ]
 
 
-def extract_cache_usage(response: Any) -> tuple[int, int]:
-    """Cache read/write input-token counts reported by the provider.
-
-    Providers name these differently: Anthropic reports
-    `cache_read_input_tokens`/`cache_creation_input_tokens` on the usage object,
-    while OpenAI-style responses report only reads, under
-    `prompt_tokens_details.cached_tokens`. Anything else reports neither, in
-    which case both counts are 0.
-
-    Returns:
-        `(cache_read_tokens, cache_write_tokens)`
-    """
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0, 0
-
-    def _int(value: Any) -> int:
-        return int(value) if isinstance(value, (int, float)) else 0
-
-    read = _int(getattr(usage, "cache_read_input_tokens", None))
-    if not read:
-        details = getattr(usage, "prompt_tokens_details", None)
-        read = _int(getattr(details, "cached_tokens", None)) if details is not None else 0
-    write = _int(getattr(usage, "cache_creation_input_tokens", None))
-    return read, write
-
-
 class GlobalStats(PydanticBaseModel):
     """This class tracks usage numbers (costs etc.) across all instances."""
 
@@ -323,10 +296,6 @@ class InstanceStats(PydanticBaseModel):
     tokens_sent: int = 0
     tokens_received: int = 0
     api_calls: int = 0
-    cache_read_tokens: int = 0
-    """Input tokens the provider served from its prompt cache. A subset of `tokens_sent`."""
-    cache_write_tokens: int = 0
-    """Input tokens the provider charged for writing a new cache entry. A subset of `tokens_sent`."""
 
     def __add__(self, other: InstanceStats) -> InstanceStats:
         return InstanceStats(
@@ -366,9 +335,10 @@ def _handle_raise_commands(action: str) -> None:
     elif action.startswith("raise_function_calling"):
         parts = shlex.split(action)
         error_code = parts[1]
-        error_message = parts[2] if len(parts) == 3 else ""
+        if len(parts) == 3:
+            error_message = parts[2]
         assert len(parts) < 4
-        raise FunctionCallingFormatError(error_message, error_code)
+        raise FunctionCallingFormatError(error_message, error_code)  # type: ignore
 
 
 class HumanModel(AbstractModel):
@@ -442,7 +412,7 @@ class HumanModel(AbstractModel):
             action = "\n".join(buffer)
         else:
             # Input has escaped things like \n, so we need to unescape it
-            action = action.encode("raw_unicode_escape").decode("unicode_escape")
+            action = action.encode("utf8").decode("unicode_escape")
         if action.strip() and action.strip().split()[0] == "spend_money":
             money = float(action.strip().split()[1])
             self.stats.instance_cost += money
@@ -510,8 +480,6 @@ class ReplayModel(AbstractModel):
         self._action_idx = 0
         self.use_function_calling = tools.use_function_calling
         self.submit_command = tools.submit_command
-        self.parse_function = tools.parse_function
-        self.commands = tools.commands
         self.logger = get_logger("swea-lm", emoji="🤖")
 
     def _next_replay(self) -> None:
@@ -519,35 +487,12 @@ class ReplayModel(AbstractModel):
         self._replay_idx += 1
         self._action_idx = 0
 
-    def _is_submit_action(self, action: str | dict) -> bool:
-        """Check if the replayed action is the submit command. Handles legacy string
-        actions as well as the dict actions written by `run-replay`, where the submit
-        command is either part of the message or a tool call. The executable action
-        is extracted with the configured parser, so a `submit` mentioned in the
-        discussion outside the action does not advance the replay.
-        """
-        if isinstance(action, dict):
-            if tool_calls := action.get("tool_calls"):
-                return any(tool_call["function"]["name"] == self.submit_command for tool_call in tool_calls)
-            model_response = action
-        else:
-            model_response = {"message": action}
-        try:
-            _, executable_action = self.parse_function(model_response, self.commands)
-            return executable_action.strip() == self.submit_command
-        except Exception:
-            # An action that cannot be parsed cannot be shown to be the submit
-            # command; the replay continues and the end-of-trajectory fallback
-            # submits if this was the missing submission.
-            self.logger.warning("Could not parse replayed action to check for submission: %s", model_response)
-            return False
-
     def query(self, history: History) -> dict:
         """Logic for tracking which replay action to pass to SWEEnv"""
         self.stats.api_calls += 1
+        actions = self._replays[self._replay_idx]
         try:
-            action = self._replays[self._replay_idx][self._action_idx]
-            replayed = True
+            action = actions[self._action_idx]
         except IndexError:
             # log error
             self.logger.error("Reached end of replay trajectory without submitting. Submitting now.")
@@ -567,15 +512,13 @@ class ReplayModel(AbstractModel):
                 }
             else:
                 action = f"```\n{self.submit_command}\n```"
-            replayed = False
 
         self._action_idx += 1
 
         # Assuming `submit` is always last action of replay trajectory
-        # (the auto-generated submission ends the instance even when the
-        # configured parser would not extract it as the submit command)
-        if not replayed or self._is_submit_action(action):
+        if isinstance(action, str) and action == "submit":
             self._next_replay()
+            return {"message": action}
 
         # Handle both dict and string actions
         if isinstance(action, dict):
@@ -686,30 +629,18 @@ class LiteLLMModel(AbstractModel):
         """Cost limit for the model. Returns 0 if there is no limit."""
         return self.config.per_instance_cost_limit
 
-    def _update_stats(
-        self,
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        cost: float,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-    ) -> None:
+    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
         with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.total_cost += cost
         self.stats.instance_cost += cost
         self.stats.tokens_sent += input_tokens
         self.stats.tokens_received += output_tokens
-        self.stats.cache_read_tokens += cache_read_tokens
-        self.stats.cache_write_tokens += cache_write_tokens
         self.stats.api_calls += 1
 
         # Log updated cost values to std. err
         self.logger.debug(
             f"input_tokens={input_tokens:,}, "
             f"output_tokens={output_tokens:,}, "
-            f"cache_read_tokens={cache_read_tokens:,}, "
-            f"cache_write_tokens={cache_write_tokens:,}, "
             f"instance_cost={self.stats.instance_cost:.2f}, "
             f"cost={cost:.2f}",
         )
@@ -758,7 +689,6 @@ class LiteLLMModel(AbstractModel):
                 del message["thinking_blocks"]
         input_tokens: int = litellm.utils.token_counter(
             messages=messages_no_cache_control,
-            tools=self.tools.tools if self.tools.use_function_calling else None,
             model=self.custom_tokenizer["identifier"] if self.custom_tokenizer is not None else self.config.name,
             custom_tokenizer=self.custom_tokenizer,
         )
@@ -781,8 +711,6 @@ class LiteLLMModel(AbstractModel):
         completion_kwargs = copy.deepcopy(self.config.completion_kwargs)
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
-        elif self.config.max_output_tokens is not None and self.config.max_output_tokens > 0:
-            completion_kwargs["max_tokens"] = self.config.max_output_tokens
 
         # Add User-Agent header (don't override user-provided headers)
         if "extra_headers" not in completion_kwargs:
@@ -849,39 +777,26 @@ class LiteLLMModel(AbstractModel):
             ):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
             outputs.append(output_dict)
-        cache_read_tokens, cache_write_tokens = extract_cache_usage(response)
-        self._update_stats(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=cost,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-        )
+        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
 
-    def _query(
-        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
-    ) -> list[dict]:
-        if n is None:
-            return self._single_query(messages, temperature=temperature)
-        outputs = []
-        # not needed for openai, but oh well.
-        for _ in range(n):
-            outputs.extend(self._single_query(messages, temperature=temperature))
-        return outputs
+    def _retrying_single_query(self, messages: list[dict[str, str]], temperature: float | None = None) -> list[dict]:
+        """Run one sample, retrying transient failures.
 
-    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
-        messages = self._history_to_messages(history)
+        The retry sits around a *single* sample rather than around the whole
+        `n`-sample batch: a sample that already completed has been paid for, and
+        re-issuing it because a later sample failed bills it twice.
+        """
 
         def retry_warning(retry_state: RetryCallState):
             exception_info = ""
-            if attempt.retry_state.outcome is not None and attempt.retry_state.outcome.exception() is not None:
-                exception = attempt.retry_state.outcome.exception()
+            if retry_state.outcome is not None and retry_state.outcome.exception() is not None:
+                exception = retry_state.outcome.exception()
                 exception_info = f" due to {exception.__class__.__name__}: {str(exception)}"
 
             self.logger.warning(
-                f"Retrying LM query: attempt {attempt.retry_state.attempt_number} "
-                f"(slept for {attempt.retry_state.idle_for:.2f}s)"
+                f"Retrying LM query: attempt {retry_state.attempt_number} "
+                f"(slept for {retry_state.idle_for:.2f}s)"
                 f"{exception_info}"
             )
 
@@ -911,7 +826,23 @@ class LiteLLMModel(AbstractModel):
             before_sleep=retry_warning,
         ):
             with attempt:
-                result = self._query(messages, n=n, temperature=temperature)
+                result = self._single_query(messages, temperature=temperature)
+        return result
+
+    def _query(
+        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
+    ) -> list[dict]:
+        if n is None:
+            return self._retrying_single_query(messages, temperature=temperature)
+        outputs = []
+        # not needed for openai, but oh well.
+        for _ in range(n):
+            outputs.extend(self._retrying_single_query(messages, temperature=temperature))
+        return outputs
+
+    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        messages = self._history_to_messages(history)
+        result = self._query(messages, n=n, temperature=temperature)
         if n is None or n == 1:
             return result[0]
         return result

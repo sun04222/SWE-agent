@@ -60,10 +60,10 @@ def _set_cache_control(entry: HistoryItem) -> None:
             }
         ]
     else:
-        entry["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        entry["content"][0]["cache_control"] = {"type": "ephemeral"}
     if entry["role"] == "tool":
         # Workaround for weird bug
-        entry["content"][-1].pop("cache_control", None)
+        entry["content"][0].pop("cache_control", None)
         entry["cache_control"] = {"type": "ephemeral"}
 
 
@@ -114,7 +114,7 @@ class LastNObservations(BaseModel):
     n: int
     """Number of observations to keep."""
 
-    polling: int = Field(default=1, ge=1)
+    polling: int = 1
     """How many steps to keep between updating the number of observations to keep.
     This is useful for caching, as we want to remove more and more messages, but every
     time we change the history, we need to cache everything again.
@@ -238,18 +238,14 @@ class ClosedWindowHistoryProcessor(BaseModel):
             if data.get("is_demo", False):
                 new_history.append(entry)
                 continue
-            content = entry.get("content")
-            if not isinstance(content, str):
-                new_history.append(entry)
-                continue
-            matches = list(self._pattern.finditer(content))
+            matches = list(self._pattern.finditer(entry["content"]))
             if len(matches) >= 1:
-                file_match = self._file_pattern.search(content)
-                if not file_match:
-                    # A numbered line that is not a file window is still a message.
+                file_match = self._file_pattern.search(entry["content"])
+                if file_match:
+                    file = file_match.group(1)
+                else:
                     new_history.append(data)
                     continue
-                file = file_match.group(1)
                 if file in windows:
                     start = matches[0].start()
                     end = matches[-1].end()
@@ -299,7 +295,6 @@ class CacheControlHistoryProcessor(BaseModel):
             if (
                 n_tagged < self.last_n_messages
                 and entry["role"] in self.tagged_roles
-                and entry["content"]
                 and i_entry >= self.last_n_messages_offset
             ):
                 _set_cache_control(entry)
@@ -311,7 +306,7 @@ class CacheControlHistoryProcessor(BaseModel):
 class RemoveRegex(BaseModel):
     """This history processor can remove arbitrary content from history items"""
 
-    remove: list[str] = ["<diff>.*?</diff>"]
+    remove: list[str] = ["<diff>.*</diff>"]
     """Regex patterns to remove from history items"""
 
     keep_last: int = 0
@@ -359,22 +354,9 @@ class ImageParsingHistoryProcessor(BaseModel):
         if entry.get("role") not in ["user", "tool"]:
             return entry
         entry = copy.deepcopy(entry)
-        content = entry["content"]
-        if isinstance(content, str):
-            segments = self._parse_images(content)
-            if any(seg["type"] == "image_url" for seg in segments):
-                entry["content"] = segments
-        else:
-            segments = []
-            for item in content:
-                if item.get("type") != "text":
-                    segments.append(item)
-                    continue
-                parsed = self._parse_images(item["text"])
-                if any(seg["type"] == "image_url" for seg in parsed):
-                    segments.extend(parsed)
-                else:
-                    segments.append(item)
+        content = _get_content_text(entry)
+        segments = self._parse_images(content)
+        if any(seg["type"] == "image_url" for seg in segments):
             entry["content"] = segments
         return entry
 
@@ -395,10 +377,9 @@ class ImageParsingHistoryProcessor(BaseModel):
             add_text(content[last_end : match.start()])
             mime_type = "image/jpeg" if mime_type == "image/jpg" else mime_type
             if mime_type in self.allowed_mime_types:
-                # The markdown wrapper is the image. Keep the alt text, not `![...](data:`.
-                if alt_text:
-                    add_text(alt_text)
+                add_text(markdown_prefix)
                 segments.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}})
+                add_text(markdown_suffix)
                 has_images = True
             else:
                 add_text(match.group(0))

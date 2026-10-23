@@ -754,7 +754,7 @@ class LiteLLMModel(AbstractModel):
                 raise ModelConfigurationError(msg)
             cost = 0
         choices: litellm.types.utils.Choices = response.choices  # type: ignore
-        n_choices = min(n if n is not None else 1, len(choices))
+        n_choices = n if n is not None else 1
         outputs = []
         output_tokens = 0
         for i in range(n_choices):
@@ -785,19 +785,10 @@ class LiteLLMModel(AbstractModel):
     ) -> list[dict]:
         if n is None:
             return self._single_query(messages, temperature=temperature)
-        try:
-            # Native sampling sends the prompt once and lets the provider return
-            # multiple completions, which avoids multiplying prompt-token cost.
-            outputs = self._single_query(messages, n=n, temperature=temperature)
-        except litellm.exceptions.UnsupportedParamsError:
-            # Preserve compatibility with providers that do not implement n>1.
-            outputs = []
-        # Some providers silently drop unsupported parameters when LiteLLM is
-        # configured with drop_params, returning fewer choices instead of
-        # raising UnsupportedParamsError. Top up those results through the
-        # existing one-sample fallback so _query still honors n.
-        for _ in range(n - len(outputs)):
-            outputs.extend(self._single_query(messages, temperature=temperature))
+        outputs = []
+        # not needed for openai, but oh well.
+        for _ in range(n):
+            outputs.extend(self._single_query(messages))
         return outputs
 
     def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
@@ -805,55 +796,46 @@ class LiteLLMModel(AbstractModel):
 
         def retry_warning(retry_state: RetryCallState):
             exception_info = ""
-            if retry_state.outcome is not None and retry_state.outcome.exception() is not None:
-                exception = retry_state.outcome.exception()
+            if attempt.retry_state.outcome is not None and attempt.retry_state.outcome.exception() is not None:
+                exception = attempt.retry_state.outcome.exception()
                 exception_info = f" due to {exception.__class__.__name__}: {str(exception)}"
 
             self.logger.warning(
-                f"Retrying LM query: attempt {retry_state.attempt_number} "
-                f"(slept for {retry_state.idle_for:.2f}s)"
+                f"Retrying LM query: attempt {attempt.retry_state.attempt_number} "
+                f"(slept for {attempt.retry_state.idle_for:.2f}s)"
                 f"{exception_info}"
             )
 
-        def query_with_retry() -> list[dict]:
-            for attempt in Retrying(
-                stop=stop_after_attempt(self.config.retry.retries),
-                wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
-                reraise=True,
-                retry=retry_if_not_exception_type(
-                    (
-                        ContextWindowExceededError,
-                        CostLimitExceededError,
-                        RuntimeError,
-                        litellm.exceptions.UnsupportedParamsError,
-                        litellm.exceptions.NotFoundError,
-                        litellm.exceptions.PermissionDeniedError,
-                        litellm.exceptions.ContextWindowExceededError,
-                        litellm.exceptions.APIError,
-                        litellm.exceptions.ContentPolicyViolationError,
-                        TypeError,
-                        litellm.exceptions.AuthenticationError,
-                        ContentPolicyViolationError,
-                        ModelConfigurationError,
-                        KeyboardInterrupt,
-                        IndexError,
-                    )
-                ),
-                before_sleep=retry_warning,
-            ):
-                with attempt:
-                    return self._query(messages, temperature=temperature)
-            raise AssertionError
-
+        for attempt in Retrying(
+            stop=stop_after_attempt(self.config.retry.retries),
+            wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
+            reraise=True,
+            retry=retry_if_not_exception_type(
+                (
+                    ContextWindowExceededError,
+                    CostLimitExceededError,
+                    RuntimeError,
+                    litellm.exceptions.UnsupportedParamsError,
+                    litellm.exceptions.NotFoundError,
+                    litellm.exceptions.PermissionDeniedError,
+                    litellm.exceptions.ContextWindowExceededError,
+                    litellm.exceptions.APIError,
+                    litellm.exceptions.ContentPolicyViolationError,
+                    TypeError,
+                    litellm.exceptions.AuthenticationError,
+                    ContentPolicyViolationError,
+                    ModelConfigurationError,
+                    KeyboardInterrupt,
+                    IndexError,
+                )
+            ),
+            before_sleep=retry_warning,
+        ):
+            with attempt:
+                result = self._query(messages, n=n, temperature=temperature)
         if n is None or n == 1:
-            return query_with_retry()[0]
-
-        # Retry each sample independently. Retrying the whole batch would issue
-        # and bill successful prefix samples again when a later sample fails.
-        outputs = []
-        for _ in range(n):
-            outputs.extend(query_with_retry())
-        return outputs
+            return result[0]
+        return result
 
     def _history_to_messages(
         self,

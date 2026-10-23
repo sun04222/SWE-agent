@@ -69,16 +69,6 @@ class AbstractParseFunction(ABC):
 # DEFINE NEW PARSING FUNCTIONS BELOW THIS LINE
 
 
-def _format_argument_value(value: Any, command: Command) -> Any:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return quote(value) if _should_quote(value, command) else value
-    if isinstance(value, list | tuple):
-        return [_format_argument_value(item, command) for item in value]
-    return value
-
-
 class ActionParser(AbstractParseFunction, BaseModel):
     """
     Expects the model response to be a single command.
@@ -218,16 +208,10 @@ class XMLThoughtActionParser(AbstractParseFunction, BaseModel):
         )  # start after the last <command> tag
         end_thought = model_response["message"].rfind("<command>")  # end before the last <command> tag
         end_action = model_response["message"].rfind("</command>")  # end before the last </command> tag
-        if end_action < start_action:
-            msg = "The final <command> tag has no matching closing tag."
-            raise FormatError(msg)
         restart_thought = model_response["message"].rfind("</command>") + len(
             "</command>"
         )  # start after the last </command> tag
         # `thought` is everything not in between <command> and </command> tags (includes after the last </command> tag)
-        if end_action < start_action:
-            msg = "No action found in model response."
-            raise FormatError(msg)
         action = model_response["message"][start_action:end_action]
         thought = model_response["message"][:end_thought] + model_response["message"][restart_thought:]
 
@@ -301,14 +285,10 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             # Check that value is format as [x, y]
             v = params_dict["view_range"]
             if isinstance(v, str):
-                if re.fullmatch(r"\[\s*\d+\s*,\s*-?\d+\s*\]", v) is None:
+                if not re.match(r"\[\d+,\s*\d+\]", v):
                     msg = f"view_range must be in the format [<start>, <end>], got {v}."
                     raise FormatError(msg)
-                try:
-                    params_dict["view_range"] = json.loads(v)
-                except json.JSONDecodeError as err:
-                    msg = f"view_range must be in the format [<start>, <end>], got {v}."
-                    raise FormatError(msg) from err
+                params_dict["view_range"] = json.loads(v)
 
         # Check if all required arguments are there
         required_args = {arg.name for arg in command.arguments if arg.required}
@@ -329,7 +309,11 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
 
         # Format arguments using their individual argument_format
         formatted_args = {
-            arg.name: Template(arg.argument_format).render(value=_format_argument_value(params_dict[arg.name], command))
+            arg.name: Template(arg.argument_format).render(
+                value=quote(params_dict[arg.name])
+                if _should_quote(params_dict[arg.name], command)
+                else params_dict[arg.name]
+            )
             if arg.name in params_dict
             else ""
             for arg in command.arguments
@@ -424,9 +408,6 @@ class FunctionCallingParser(AbstractParseFunction, BaseModel):
                 raise FunctionCallingFormatError(msg, "invalid_json")
         else:
             values = tool_call["function"]["arguments"]
-        if not isinstance(values, dict):
-            msg = "Tool call arguments must be a JSON object."
-            raise FunctionCallingFormatError(msg, "invalid_json")
         required_args = {arg.name for arg in command.arguments if arg.required}
         missing_args = required_args - values.keys()
         if missing_args:
@@ -441,8 +422,16 @@ class FunctionCallingParser(AbstractParseFunction, BaseModel):
             msg = f"Unexpected argument(s): {', '.join(extra_args)}"
             raise FunctionCallingFormatError(msg, "unexpected_arg")
 
+        def get_quoted_arg(value: Any) -> str:
+            if isinstance(value, str):
+                return quote(value) if _should_quote(value, command) else value
+            # See https://github.com/SWE-agent/SWE-agent/issues/1159
+            if value is None:
+                return ""
+            return value
+
         formatted_args = {
-            arg.name: Template(arg.argument_format).render(value=_format_argument_value(values[arg.name], command))
+            arg.name: Template(arg.argument_format).render(value=get_quoted_arg(values[arg.name]))
             if arg.name in values
             else ""
             for arg in command.arguments
@@ -536,7 +525,8 @@ class JsonParser(AbstractParseFunction, BaseModel):
                 for arg in command.arguments:
                     if arg.name in data_command.get("arguments", {}):
                         value = data_command["arguments"][arg.name]
-                        value = _format_argument_value(value, command)
+                        if _should_quote(value, command):
+                            value = quote(value)
                         formatted_args[arg.name] = Template(arg.argument_format).render(value=value)
                     elif strict and arg.required:
                         msg = f"Required argument '{arg.name}' missing for command '{command.name}'"

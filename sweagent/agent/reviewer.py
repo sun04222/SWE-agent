@@ -21,7 +21,6 @@ from sweagent.agent.models import (
     get_model,
 )
 from sweagent.agent.problem_statement import ProblemStatement
-from sweagent.exceptions import CostLimitExceededError
 from sweagent.tools.parsing import ActionParser
 from sweagent.tools.tools import ToolConfig
 from sweagent.types import AgentInfo, Trajectory, TrajectoryStep
@@ -294,14 +293,8 @@ class Chooser:
     def __init__(self, config: ChooserConfig):
         self.config = config
         self.model = get_model(config.model, ToolConfig(parse_function=ActionParser()))
-        self._preselector: Preselector | None = None
         self.logger = get_logger("chooser", emoji="🧠")
         # self.summarizer = Summarizer(config.summarizer, self.model) if config.summarizer else None
-
-    @property
-    def model_stats(self) -> InstanceStats:
-        preselector_stats = self._preselector.model.stats if self._preselector else InstanceStats()
-        return self.model.stats + preselector_stats
 
     def interpret(self, response: str) -> int:
         # Use regex to extract the last number of the response
@@ -343,10 +336,9 @@ class Chooser:
         else:
             self.logger.debug(f"Got only {n_submitted} submitted submissions, disabling exit status filtering")
         if self.config.preselector and len(selected_indices) > 2:
-            if self._preselector is None:
-                self._preselector = Preselector(self.config.preselector)
+            preselector = Preselector(self.config.preselector)
             try:
-                preselector_output = self._preselector.choose(problem_statement, [input[i] for i in selected_indices])
+                preselector_output = preselector.choose(problem_statement, [input[i] for i in selected_indices])
             except Exception as e:
                 self.logger.critical(f"Preselector failed: {e}", exc_info=True)
                 preselector_output = None
@@ -364,12 +356,9 @@ class Chooser:
                 self.logger.error("Preselector must have failed, ignoring it.")
         messages = self.build_messages(problem_statement, [input[i] for i in selected_indices])
         chosen_idx = None
-        response = ""
         try:
             response = self.model.query(messages)["message"]  # type: ignore
             chosen_idx = self.interpret(response)
-        except CostLimitExceededError:
-            raise
         except Exception as e:
             self.logger.critical(f"Chooser failed: {e}", exc_info=True)
             chosen_idx = None
@@ -518,16 +507,12 @@ class ChooserRetryLoop(AbstractRetryLoop):
         self._chooser_output: ChooserOutput | None = None
 
     @property
-    def _attempt_stats(self) -> InstanceStats:
+    def _total_stats(self) -> InstanceStats:
         return sum((s.model_stats for s in self._submissions), start=InstanceStats())
 
     @property
     def review_model_stats(self) -> InstanceStats:
-        return self._chooser.model_stats
-
-    @property
-    def _total_stats(self) -> InstanceStats:
-        return self._attempt_stats + self.review_model_stats
+        return InstanceStats()
 
     @property
     def _n_attempts(self) -> int:
@@ -538,9 +523,9 @@ class ChooserRetryLoop(AbstractRetryLoop):
 
     def retry(self) -> bool:
         stat_str = f"n_samples={self._n_attempts}"
-        if self._attempt_stats.instance_cost > self._config.cost_limit > 0:
+        if self._total_stats.instance_cost > self._config.cost_limit > 0:
             self.logger.info(
-                f"Exiting retry loop ({stat_str}): Total attempt cost ({self._attempt_stats.instance_cost}) "
+                f"Exiting retry loop ({stat_str}): Total attempt cost ({self._total_stats.instance_cost}) "
                 f"exceeds cost limit ({self._config.cost_limit})"
             )
             return False
@@ -549,7 +534,7 @@ class ChooserRetryLoop(AbstractRetryLoop):
             self.logger.info(f"Exiting retry loop ({stat_str}): max_attempts={self._config.max_attempts} reached")
             return False
 
-        remaining_budget = self._config.cost_limit - self._attempt_stats.instance_cost
+        remaining_budget = self._config.cost_limit - self._total_stats.instance_cost
         if self._config.min_budget_for_new_attempt > 0 and remaining_budget < self._config.min_budget_for_new_attempt:
             msg = (
                 f"Exiting retry loop ({stat_str}): Not enough budget left for a new attempt "

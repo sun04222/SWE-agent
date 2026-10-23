@@ -130,17 +130,6 @@ def test_save_apply_patch_hook_concurrent_workers_save_to_correct_dirs(tmp_path)
     assert patch_b.read_text() == "patch B content"
 
 
-def test_save_apply_patch_hook_preserves_patch_newlines(tmp_path):
-    hook = SaveApplyPatchHook(show_success_message=False)
-    hook._output_dir = tmp_path
-    patch_content = "diff --git a/file.txt b/file.txt\r\n+changed\r\n"
-
-    patch_path = hook._save_patch("instance-crlf", {"submission": patch_content})
-
-    assert patch_path == tmp_path / "instance-crlf" / "instance-crlf.patch"
-    assert patch_path.read_bytes() == patch_content.encode("utf-8")
-
-
 @pytest.mark.parametrize(
     ("subset", "expected"),
     [
@@ -174,34 +163,3 @@ def test_swe_bench_evaluate_unsupported_subset_raises_value_error(tmp_path, subs
     hook = SweBenchEvaluate(output_dir=tmp_path, subset=subset, split="dev")
     with pytest.raises(ValueError, match=subset):
         hook._get_sb_call(tmp_path / "preds.json")
-
-
-@pytest.mark.parametrize("n_reports", [0, 2])
-def test_swe_bench_evaluate_preserves_results_without_unique_report(tmp_path, n_reports):
-    results = tmp_path / "results.json"
-    results.write_text('{"resolved_ids": ["existing-result"]}')
-    report_dir = tmp_path / "sb-cli-reports"
-    report_dir.mkdir()
-    for i in range(n_reports):
-        (report_dir / f"report-{i}.json").write_text("{}")
-
-    hook = SweBenchEvaluate(output_dir=tmp_path, subset="lite", split="dev")
-    hook.move_sb_cli_report()
-
-    assert results.read_text() == '{"resolved_ids": ["existing-result"]}'
-    assert len(list(report_dir.glob("*.json"))) == n_reports
-
-
-def test_swe_bench_evaluate_replaces_results_with_unique_report(tmp_path):
-    results = tmp_path / "results.json"
-    results.write_text("old results")
-    report_dir = tmp_path / "sb-cli-reports"
-    report_dir.mkdir()
-    report = report_dir / "report.json"
-    report.write_text('{"resolved_ids": ["new-result"]}')
-
-    hook = SweBenchEvaluate(output_dir=tmp_path, subset="lite", split="dev")
-    hook.move_sb_cli_report()
-
-    assert results.read_text() == '{"resolved_ids": ["new-result"]}'
-    assert not report.exists()

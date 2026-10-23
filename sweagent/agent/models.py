@@ -289,27 +289,12 @@ GLOBAL_STATS_LOCK = Lock()
 """Lock for accessing `GLOBAL_STATS` without race conditions"""
 
 
-def _get_usage_value(usage: Any, field: str) -> Any:
-    if usage is None:
-        return None
-    if isinstance(usage, dict):
-        return usage.get(field)
-    return getattr(usage, field, None)
-
-
-def _get_usage_int(usage: Any, field: str) -> int | None:
-    value = _get_usage_value(usage, field)
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
 class InstanceStats(PydanticBaseModel):
     """This object tracks usage numbers (costs etc.) for a single instance."""
 
     instance_cost: float = 0
     tokens_sent: int = 0
     tokens_received: int = 0
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
     api_calls: int = 0
 
     def __add__(self, other: InstanceStats) -> InstanceStats:
@@ -644,22 +629,12 @@ class LiteLLMModel(AbstractModel):
         """Cost limit for the model. Returns 0 if there is no limit."""
         return self.config.per_instance_cost_limit
 
-    def _update_stats(
-        self,
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        cost: float,
-        cache_read_input_tokens: int = 0,
-        cache_creation_input_tokens: int = 0,
-    ) -> None:
+    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
         with GLOBAL_STATS_LOCK:
             GLOBAL_STATS.total_cost += cost
         self.stats.instance_cost += cost
         self.stats.tokens_sent += input_tokens
         self.stats.tokens_received += output_tokens
-        self.stats.cache_read_input_tokens += cache_read_input_tokens
-        self.stats.cache_creation_input_tokens += cache_creation_input_tokens
         self.stats.api_calls += 1
 
         # Log updated cost values to std. err
@@ -802,36 +777,22 @@ class LiteLLMModel(AbstractModel):
             ):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
             outputs.append(output_dict)
-        usage = getattr(response, "usage", None)
-        provider_input_tokens = _get_usage_int(usage, "prompt_tokens")
-        provider_output_tokens = _get_usage_int(usage, "completion_tokens")
-        if provider_input_tokens is not None:
-            input_tokens = provider_input_tokens
-        if provider_output_tokens is not None:
-            output_tokens = provider_output_tokens
-        prompt_tokens_details = _get_usage_value(usage, "prompt_tokens_details")
-        cache_read_input_tokens = _get_usage_int(prompt_tokens_details, "cache_read_input_tokens")
-        if cache_read_input_tokens is None:
-            cache_read_input_tokens = _get_usage_int(prompt_tokens_details, "cached_tokens")
-        cache_creation_input_tokens = _get_usage_int(prompt_tokens_details, "cache_creation_input_tokens")
-        if cache_creation_input_tokens is None:
-            cache_creation_input_tokens = _get_usage_int(prompt_tokens_details, "cache_write_tokens")
-        self._update_stats(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=cost,
-            cache_read_input_tokens=cache_read_input_tokens or 0,
-            cache_creation_input_tokens=cache_creation_input_tokens or 0,
-        )
+        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
 
-    def _retrying_single_query(self, messages: list[dict[str, str]], temperature: float | None = None) -> list[dict]:
-        """Run one sample, retrying transient failures.
+    def _query(
+        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
+    ) -> list[dict]:
+        if n is None:
+            return self._single_query(messages, temperature=temperature)
+        outputs = []
+        # not needed for openai, but oh well.
+        for _ in range(n):
+            outputs.extend(self._single_query(messages))
+        return outputs
 
-        The retry sits around a *single* sample rather than around the whole
-        `n`-sample batch: a sample that already completed has been paid for, and
-        re-issuing it because a later sample failed bills it twice.
-        """
+    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        messages = self._history_to_messages(history)
 
         def retry_warning(retry_state: RetryCallState):
             exception_info = ""
@@ -845,52 +806,45 @@ class LiteLLMModel(AbstractModel):
                 f"{exception_info}"
             )
 
-        for attempt in Retrying(
-            stop=stop_after_attempt(self.config.retry.retries),
-            wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
-            reraise=True,
-            retry=retry_if_not_exception_type(
-                (
-                    ContextWindowExceededError,
-                    CostLimitExceededError,
-                    RuntimeError,
-                    litellm.exceptions.UnsupportedParamsError,
-                    litellm.exceptions.NotFoundError,
-                    litellm.exceptions.PermissionDeniedError,
-                    litellm.exceptions.ContextWindowExceededError,
-                    litellm.exceptions.APIError,
-                    litellm.exceptions.ContentPolicyViolationError,
-                    TypeError,
-                    litellm.exceptions.AuthenticationError,
-                    ContentPolicyViolationError,
-                    ModelConfigurationError,
-                    KeyboardInterrupt,
-                    IndexError,
-                )
-            ),
-            before_sleep=retry_warning,
-        ):
-            with attempt:
-                result = self._single_query(messages, temperature=temperature)
-        return result
+        def query_with_retry() -> list[dict]:
+            for attempt in Retrying(
+                stop=stop_after_attempt(self.config.retry.retries),
+                wait=wait_random_exponential(min=self.config.retry.min_wait, max=self.config.retry.max_wait),
+                reraise=True,
+                retry=retry_if_not_exception_type(
+                    (
+                        ContextWindowExceededError,
+                        CostLimitExceededError,
+                        RuntimeError,
+                        litellm.exceptions.UnsupportedParamsError,
+                        litellm.exceptions.NotFoundError,
+                        litellm.exceptions.PermissionDeniedError,
+                        litellm.exceptions.ContextWindowExceededError,
+                        litellm.exceptions.APIError,
+                        litellm.exceptions.ContentPolicyViolationError,
+                        TypeError,
+                        litellm.exceptions.AuthenticationError,
+                        ContentPolicyViolationError,
+                        ModelConfigurationError,
+                        KeyboardInterrupt,
+                        IndexError,
+                    )
+                ),
+                before_sleep=retry_warning,
+            ):
+                with attempt:
+                    return self._query(messages, temperature=temperature)
+            raise AssertionError
 
-    def _query(
-        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
-    ) -> list[dict]:
-        if n is None:
-            return self._retrying_single_query(messages, temperature=temperature)
-        outputs = []
-        # not needed for openai, but oh well.
-        for _ in range(n):
-            outputs.extend(self._retrying_single_query(messages, temperature=temperature))
-        return outputs
-
-    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
-        messages = self._history_to_messages(history)
-        result = self._query(messages, n=n, temperature=temperature)
         if n is None or n == 1:
-            return result[0]
-        return result
+            return query_with_retry()[0]
+
+        # Retry each sample independently. Retrying the whole batch would issue
+        # and bill successful prefix samples again when a later sample fails.
+        outputs = []
+        for _ in range(n):
+            outputs.extend(query_with_retry())
+        return outputs
 
     def _history_to_messages(
         self,

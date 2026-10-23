@@ -106,7 +106,7 @@ def test_user_agent_header_with_other_extra_headers():
         assert extra_headers["X-Custom"] == "value"
 
 
-def test_provider_usage_updates_token_and_cache_stats():
+def test_multi_sample_retries_only_the_failed_sample():
     model = get_model(
         GenericAPIModelConfig(
             name="gpt-4o",
@@ -114,17 +114,28 @@ def test_provider_usage_updates_token_and_cache_stats():
             top_p=None,
             per_instance_cost_limit=0,
             total_cost_limit=0,
+            retry={"retries": 2, "min_wait": 0, "max_wait": 0},
         ),
         ToolConfig(parse_function=Identity()),
     )
-    mock_response = _make_mock_response()
-    mock_response.usage.prompt_tokens = 123
-    mock_response.usage.completion_tokens = 45
-    mock_response.usage.prompt_tokens_details = {"cached_tokens": 67, "cache_write_tokens": 8}
-    with patch("litellm.completion", return_value=mock_response):
-        model.query(History([{"role": "user", "content": "test"}]))
+    sample_results = iter(
+        [
+            [{"message": "first"}],
+            ValueError("transient failure"),
+            [{"message": "second"}],
+        ]
+    )
 
-    assert model.stats.tokens_sent == 123
-    assert model.stats.tokens_received == 45
-    assert model.stats.cache_read_input_tokens == 67
-    assert model.stats.cache_creation_input_tokens == 8
+    def query_sample(*args, **kwargs):
+        result = next(sample_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    with patch.object(model, "_query", side_effect=query_sample) as query:
+        assert model.query(History([{"role": "user", "content": "test"}]), n=2) == [
+            {"message": "first"},
+            {"message": "second"},
+        ]
+
+    assert query.call_count == 3

@@ -1,82 +1,113 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
-from sweagent.agent.models import InstanceStats
-from sweagent.agent.reviewer import Reviewer, ReviewerConfig, ReviewSubmission, TrajFormatterConfig
+from sweagent.agent.models import AbstractModel, GenericAPIModelConfig, InstanceStats
+from sweagent.agent.reviewer import (
+    Chooser,
+    ChooserConfig,
+    Preselector,
+    PreselectorConfig,
+    ReviewSubmission,
+)
+from sweagent.exceptions import (
+    InstanceCostLimitExceededError,
+    TotalCostLimitExceededError,
+)
+from sweagent.utils.log import get_logger
 
 
-class _Instance:
-    def get_problem_statement(self) -> str:
-        return "problem"
+class _RaisingModel(AbstractModel):
+    """A model whose every query fails with a fixed exception."""
 
-    def get_extra_fields(self) -> dict[str, str]:
-        return {}
+    def __init__(self, exc: Exception):
+        self._exc = exc
 
+    def query(self, *args, **kwargs):
+        raise self._exc
 
-class _SequenceModel:
-    def __init__(self, responses: list[object]):
-        self._responses = iter(responses)
-
-    def query(self, messages: list[dict[str, str]]) -> dict[str, str]:
-        response = next(self._responses)
-        if isinstance(response, Exception):
-            raise response
-        return {"message": response}  # type: ignore[dict-item]
+    @property
+    def stats(self) -> InstanceStats:
+        return InstanceStats()
 
 
-def _reviewer(
-    responses: list[object], *, reduce_by_std: float = 0.0, score_range: tuple[float, float] = (0, 10)
-) -> Reviewer:
-    config = ReviewerConfig(
+class _ConstantModel(AbstractModel):
+    """A model that always answers with the same message."""
+
+    def __init__(self, message: str):
+        self._message = message
+
+    def query(self, *args, **kwargs):
+        return {"message": self._message}
+
+    @property
+    def stats(self) -> InstanceStats:
+        return InstanceStats()
+
+
+def _chooser(model: AbstractModel, *, preselector: PreselectorConfig | None = None) -> Chooser:
+    config = ChooserConfig(
+        model=GenericAPIModelConfig(name="test-model"),
         system_template="system",
-        instance_template="{{ problem_statement }} {{ submission }}",
-        traj_formatter=TrajFormatterConfig(),
-        n_sample=5,
-        reduce_by_std=reduce_by_std,
-        score_range=score_range,
+        instance_template="instance {{problem_statement}}",
+        submission_template="submission {{submission}}",
+        preselector=preselector,
     )
-    return Reviewer(config, _SequenceModel(responses))
+    # Bypass __init__ so that no real model is instantiated.
+    chooser = object.__new__(Chooser)
+    chooser.config = config
+    chooser.logger = get_logger("test-chooser")
+    chooser.model = model
+    return chooser
 
 
 def _submission() -> ReviewSubmission:
     return ReviewSubmission(
+        submission="solution text",
         trajectory=[],
-        info={"exit_status": "submitted", "submission": "solution"},
+        info={"exit_status": "submitted", "submission": "solution text", "model_stats": {}},
         model_stats=InstanceStats(),
     )
 
 
-@pytest.mark.parametrize(
-    "failed_response",
-    [RuntimeError("query failed"), "not a score", "Score: 42"],
-    ids=["query exception", "unparsable reply", "out of range score"],
-)
-def test_failed_judge_samples_keep_the_configured_denominator(failed_response: object) -> None:
-    reviewer = _reviewer([failed_response, "Score: 9", "Score: 9", "Score: 9", "Score: 9"])
-
-    result = reviewer.review(_Instance(), _submission())
-
-    # A failed sample has the existing all-failed fallback score (-100), rather
-    # than disappearing from the n_sample-sized average.
-    assert result.accept == pytest.approx((4 * 9 - 100) / 5)
-    assert result.outputs == ["Score: 9"] * 4
+@pytest.mark.parametrize("exc_type", [TotalCostLimitExceededError, InstanceCostLimitExceededError])
+def test_chooser_propagates_cost_limit_errors(exc_type):
+    """A cost limit hit by the chooser model must abort, not be swallowed."""
+    chooser = _chooser(_RaisingModel(exc_type("cost limit")))
+    with pytest.raises(exc_type):
+        chooser.choose("problem statement", [_submission(), _submission()])
 
 
-def test_failed_judge_samples_preserve_reduce_by_std_penalty() -> None:
-    reviewer = _reviewer(
-        [
-            RuntimeError("query failed"),
-            RuntimeError("query failed"),
-            RuntimeError("query failed"),
-            RuntimeError("query failed"),
-            "Score: 9",
-        ],
-        reduce_by_std=1.0,
+def test_chooser_falls_back_when_query_fails():
+    """Any other query failure keeps the graceful fallback (no UnboundLocalError)."""
+    chooser = _chooser(_RaisingModel(RuntimeError("boom")))
+    output = chooser.choose("problem statement", [_submission(), _submission()])
+    assert output.chosen_idx == 0
+    assert output.response == ""
+
+
+def test_chooser_returns_chosen_index():
+    chooser = _chooser(_ConstantModel("I choose submission 1"))
+    output = chooser.choose("problem statement", [_submission(), _submission()])
+    assert output.chosen_idx == 1
+
+
+@pytest.mark.parametrize("exc_type", [TotalCostLimitExceededError, InstanceCostLimitExceededError])
+def test_preselector_cost_limit_propagates_through_chooser(exc_type, monkeypatch):
+    """The same holds for a cost limit raised by the preselector model."""
+    preselector_config = PreselectorConfig(
+        model=GenericAPIModelConfig(name="test-model"),
+        system_template="system",
+        instance_template="instance {{problem_statement}}",
+        submission_template="submission {{submission}}",
     )
 
-    result = reviewer.review(_Instance(), _submission())
+    def _fake_init(self, config):
+        self.config = config
+        self.logger = get_logger("test-preselector")
+        self.model = _RaisingModel(exc_type("cost limit"))
 
-    scores = [-100.0, -100.0, -100.0, -100.0, 9.0]
-    assert result.accept == pytest.approx(sum(scores) / 5 - np.std(scores))
+    monkeypatch.setattr(Preselector, "__init__", _fake_init)
+    chooser = _chooser(_ConstantModel("I choose submission 0"), preselector=preselector_config)
+    with pytest.raises(exc_type):
+        chooser.choose("problem statement", [_submission(), _submission(), _submission()])

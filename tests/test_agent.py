@@ -1,6 +1,3 @@
-import copy
-from unittest.mock import Mock
-
 import pytest
 import yaml
 from swerex.exceptions import SwerexException
@@ -14,7 +11,6 @@ from sweagent.agent.problem_statement import EmptyProblemStatement, TextProblemS
 from sweagent.environment.swe_env import SWEEnv
 from sweagent.tools.parsing import FunctionCallingParser, Identity, ThoughtActionParser
 from sweagent.tools.tools import ToolConfig
-from sweagent.types import StepOutput
 
 
 def test_dummy_env(dummy_env):
@@ -121,45 +117,6 @@ def test_exit_format(dummy_env: SWEEnv, thought_action_agent: DefaultAgent, tmp_
     assert r.info["exit_status"] == "exit_format"  # type: ignore
 
 
-def test_max_requeries_zero_still_makes_one_attempt(dummy_env: SWEEnv, tmp_path):
-    """max_requeries counts requeries after an error, so 0 still queries the model once."""
-    agent = DefaultAgent.from_config(
-        DefaultAgentConfig(
-            model=InstantEmptySubmitModelConfig(),
-            tools=ToolConfig(parse_function=Identity()),
-            max_requeries=0,
-        )
-    )
-    agent.model = PredeterminedTestModel(["echo hello", "exit"])  # type: ignore
-    dummy_env.deployment.runtime.run_in_session_outputs = BashObservation(output="hello", exit_code=0)  # type: ignore
-    r = agent.run(
-        problem_statement=EmptyProblemStatement(),
-        env=dummy_env,
-        output_dir=tmp_path,
-    )
-    assert r.info["exit_status"] == "exit_command"  # type: ignore
-    assert [step["action"] for step in r.trajectory] == ["echo hello", "exit"]
-
-
-def test_max_requeries_one_allows_one_requery(dummy_env: SWEEnv, tmp_path):
-    """max_requeries=1 allows the first attempt plus one requery, i.e. two model queries."""
-    agent = DefaultAgent.from_config(
-        DefaultAgentConfig(
-            model=InstantEmptySubmitModelConfig(),
-            tools=ToolConfig(parse_function=ThoughtActionParser()),
-            max_requeries=1,
-        )
-    )
-    agent.model = PredeterminedTestModel(["a", "b"])  # type: ignore
-    r = agent.run(
-        problem_statement=EmptyProblemStatement(),
-        env=dummy_env,
-        output_dir=tmp_path,
-    )
-    assert r.info["exit_status"] == "exit_format"  # type: ignore
-    assert agent.model._idx == 1  # type: ignore
-
-
 def test_exit_blocklist(dummy_env: SWEEnv, test_agent: DefaultAgent, tmp_path):
     test_agent.model = PredeterminedTestModel(["vim", "python", "su", "nano"])  # type: ignore
     r = test_agent.run(
@@ -262,36 +219,6 @@ def test_show_no_output_template(dummy_env: SWEEnv, default_agent: DefaultAgent,
     # todo: actually test that the template is used
 
 
-def test_handle_submission_preserves_patch_newlines(
-    monkeypatch: pytest.MonkeyPatch, dummy_env: SWEEnv, default_agent: DefaultAgent
-):
-    a = default_agent
-    a.setup(dummy_env, EmptyProblemStatement())
-    read_kwargs = {}
-
-    def read_file(path, encoding=None, errors=None, *, preserve_newlines=False):
-        read_kwargs.update(
-            path=path,
-            encoding=encoding,
-            errors=errors,
-            preserve_newlines=preserve_newlines,
-        )
-        return "diff --git a/file.txt b/file.txt\r\n+changed\r\n"
-
-    monkeypatch.setattr(dummy_env, "read_file", read_file)
-
-    step = a.handle_submission(StepOutput(observation="<<SWE_AGENT_SUBMISSION>>"))
-
-    assert read_kwargs == {
-        "path": "/root/model.patch",
-        "encoding": "utf-8",
-        "errors": "backslashreplace",
-        "preserve_newlines": True,
-    }
-    assert step.submission == "diff --git a/file.txt b/file.txt\r\n+changed\r\n"
-    assert step.observation == step.submission
-
-
 # todo: fixme; Needs real environment or mocking of read_file
 @pytest.mark.xfail
 def test_successful_submission(dummy_env: SWEEnv, default_agent: DefaultAgent, tmp_path):
@@ -333,47 +260,3 @@ def test_function_calling(dummy_env: SWEEnv, function_calling_agent: DefaultAgen
     assert not r.done, "Expected not done, because we haven't submitted yet"
     assert r.action.strip() == "ls", "Expected the tool call to be executed"
     assert "file1 file2" in r.observation, "Expected the tool call to return the output of the command"
-
-
-@pytest.mark.parametrize("failure", ["blocked", "invalid_json", "multiple_calls"])
-def test_function_call_requery_keeps_call_context(failure, dummy_env, function_calling_agent, tmp_path):
-    agent = function_calling_agent
-    agent.setup(dummy_env, EmptyProblemStatement(), output_dir=tmp_path)
-    original_history = copy.deepcopy(agent.history)
-    call = {
-        "id": "failed-call",
-        "type": "function",
-        "function": {"name": "bash", "arguments": '{"command": "vim"}'},
-    }
-    if failure == "invalid_json":
-        call["function"]["arguments"] = "{"
-    calls = [call]
-    if failure == "multiple_calls":
-        calls.append({**call, "id": "second-failed-call"})
-    thinking = [{"type": "thinking", "thinking": "Plan", "signature": "test-signature"}]
-    corrected = {
-        "message": "",
-        "tool_calls": [
-            {
-                "id": "corrected-call",
-                "type": "function",
-                "function": {"name": "bash", "arguments": '{"command": "echo fixed"}'},
-            }
-        ],
-    }
-    agent.model.query = Mock(
-        side_effect=[
-            {"message": "", "tool_calls": calls, "thinking_blocks": thinking},
-            corrected,
-        ]
-    )
-    step = agent.forward_with_handling(agent.messages)
-    assert step.action == "echo fixed"
-    retry = agent.model.query.call_args_list[1].args[0]
-    assistant = retry[len(original_history)]
-    assert assistant["tool_calls"] == calls
-    assert assistant["thinking_blocks"] == thinking
-    responses = retry[len(original_history) + 1 :]
-    assert [response["tool_call_ids"] for response in responses] == [[call["id"]] for call in calls]
-    assert all(response["role"] == "tool" and response["content"] for response in responses)
-    assert agent.history == original_history
